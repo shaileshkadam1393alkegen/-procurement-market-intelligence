@@ -26,11 +26,11 @@ SERIES={
  'eu_ppi':dict(name='Euro Area Industrial PPI Total',source='EUROSTAT',dataset='sts_inpp_m',filters={'geo':'EA20','nace_r2':'B-E36','indic_bt':'PRIN','s_adj':'NSA'},unit='index',geo='EA20',category='mro',link='https://ec.europa.eu/eurostat/web/short-term-business-statistics'),
 }
 CATEGORIES={
- 'mro':{'name':'MRO & Industrial','series':['eu_ppi','us_cpi'],'drivers':['industrial PPI','metals','machinery','freight']},
+ 'mro':{'name':'MRO & Industrial','series':['eu_ppi','us_cpi','eu_hicp'],'drivers':['industrial PPI','metals','machinery','freight']},
  'waste':{'name':'Waste Management','series':['us_energy','us_gas','us_hourly'],'drivers':['diesel proxy','labor','disposal charges']},
- 'needles':{'name':'Industrial Needles & Textiles','series':['eu_ppi','us_hourly'],'drivers':['specialty alloys','labor','manufacturing']},
+ 'needles':{'name':'Industrial Needles & Textiles','series':['eu_ppi','us_hourly','eu_hicp'],'drivers':['specialty alloys','labor','manufacturing']},
  'heating':{'name':'Heating Elements','series':['eu_ppi','us_energy'],'drivers':['nickel/chromium','industrial energy']},
- 'bearings':{'name':'Bearings & Mechanical','series':['eu_ppi','us_cpi'],'drivers':['steel','energy','freight']},
+ 'bearings':{'name':'Bearings & Mechanical','series':['eu_ppi','us_cpi','eu_hicp'],'drivers':['steel','energy','freight']},
  'ppe':{'name':'PPE & Uniforms','series':['us_cpi','us_hourly'],'drivers':['textiles','polymers','labor']},
  'labor':{'name':'Labor & Services','series':['us_hourly','us_cpi','eu_hicp'],'drivers':['wages','ECI','productivity']},
  'logistics':{'name':'Logistics & Packaging','series':['us_gas','us_energy','eu_ppi'],'drivers':['fuel','paper','polymers']},
@@ -135,7 +135,9 @@ async def pull_eurostat(client,key,config):
  ids=data['id'];sizes=data['size'];dimensions=data['dimension'];vals=data.get('value',{})
  # Reject non-singleton dimensions except time, to avoid silently mixing measures.
  for name,size in zip(ids,sizes):
-  if name!='time' and size!=1:raise ValueError(f'Ambiguous Eurostat dimension {name}={size}; review series filters')
+  if name!='time' and size!=1:
+   choices=list(dimensions[name].get('category',{}).get('index',{}).keys())
+   raise ValueError(f'Eurostat dimension {name} has {size} matches; available codes: {choices[:12]}. Verify filters for {config["dataset"]}.')
  times=dimensions['time']['category']['index'];out=[]
  for period,index in times.items():
   pos=index if isinstance(index,int) else int(index)
@@ -145,28 +147,14 @@ async def pull_eurostat(client,key,config):
 async def sync():
  now=datetime.datetime.now(datetime.timezone.utc).isoformat();out=[];success=0
  async with httpx.AsyncClient(timeout=25,follow_redirects=True,headers={'User-Agent':'ProcurementMarketIntelligence/0.1'}) as client:
+  bls_quota_exceeded=False
   for key,config in SERIES.items():
+   if config['source']=='BLS' and bls_quota_exceeded:
+    out.append({'series':key,'status':'skipped','reason':'BLS quota already reached during this sync; avoiding repeated requests.'})
+    continue
    try:
     rows=await (pull_bls(client,key,config) if config['source']=='BLS' else pull_eurostat(client,key,config))
     with connect() as c:
      for period,value,url in rows:c.execute('INSERT INTO observations VALUES(?,?,?,?,?) ON CONFLICT(series_key,period) DO UPDATE SET value=excluded.value,retrieved_at=excluded.retrieved_at,source_url=excluded.source_url',(key,period,value,now,url))
      recent=c.execute('SELECT period,value FROM observations WHERE series_key=? ORDER BY period DESC LIMIT 2',(key,)).fetchall()
      if len(recent)==2 and recent[1]['value']!=0:
-      delta=(recent[0]['value']/recent[1]['value']-1)*100
-      if abs(delta)>=2:
-       c.execute('INSERT OR IGNORE INTO alerts(series_key,period,metric,change,severity,created_at) VALUES(?,?,?,?,?,?)',(key,recent[0]['period'],'MoM',delta,'HIGH' if abs(delta)>=5 else 'WATCH',now))
-    success+=1;out.append({'series':key,'status':'ok','observations':len(rows)})
-   except Exception as e:out.append({'series':key,'status':'error','reason':str(e)[:250]})
- with connect() as c:c.execute('INSERT INTO sync_runs(at,status,details) VALUES(?,?,?)',(now,'ok' if success==len(SERIES) else 'partial' if success else 'failed',json.dumps(out)))
- return out
-@app.post('/api/admin/sync')
-async def run_sync(user=Depends(admin_user)):return {'results':await sync()}
-class Invite(BaseModel):email:str;password:str;admin:bool=False
-@app.post('/api/admin/invite')
-def invite(data:Invite,user=Depends(admin_user)):
- if len(data.password)<12:raise HTTPException(400,'Password must be at least 12 characters')
- salt=secrets.token_hex(16)
- try:
-  with connect() as c:c.execute('INSERT INTO users(email,salt,password_hash,active,admin) VALUES(?,?,?,?,?)',(data.email.strip().lower(),salt,pw_hash(data.password,salt),1,int(data.admin)))
- except sqlite3.IntegrityError:raise HTTPException(409,'User already exists')
- return {'ok':True}
